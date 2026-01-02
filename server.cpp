@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <assert.h>
+#include <vector>
+
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -100,6 +102,25 @@ static int32_t one_request(int connfd) {
 
 }
 
+static void fd_set_nb(int fd){
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL,0) | O_NONBLOCK);
+}
+
+static Conn *handle_accept(int fd){
+    struct sockaddr_in client_addr = {}
+    socklen_t addrlen = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+    if ( connfd < 0 ){
+        return NULL;
+    }
+    fd_set_nb(connfd);
+    Conn *conn = new Conn();
+    conn->fd = connfd;
+    conn->want_read = true;
+    return conn;
+
+}
+
 int main() {
 #ifdef _WIN32
     WSADATA wsa;
@@ -133,23 +154,87 @@ int main() {
         die("listen()");
     }
 
-    while (true) {
-        // accept
-        struct sockaddr_in client_addr = {};
-        socklen_t addrlen = sizeof(client_addr);
-        int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-        if (connfd < 0) {
-            continue;   // error
+    // while (true) {
+    //     // accept
+    //     struct sockaddr_in client_addr = {};
+    //     socklen_t addrlen = sizeof(client_addr);
+    //     int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+    //     if (connfd < 0) {
+    //         continue;   // error
+    //     }
+
+    //     while (true){
+    //         int32_t err = one_request(connfd);
+    //         if (err){
+    //             break;
+    //         }
+    //     }
+
+    //     close(connfd);
+    // }
+
+    // Rewriting echo server into event loop
+
+    struct Conn {}
+
+
+    std::vector<Conn *> fd2conn;
+    std::vector<struct pollfd> poll_args;
+    while (true){
+        poll_args.clear();
+        struct pollfd pfd = {fd, POLLIN, 0};
+        poll_args.push_back(pfd);
+
+        for (Conn *conn : fd2conn){
+            if (!conn) {
+                continue;
+            }
+            struct pollfd pfd = {conn->fd, POLLERR, 0};
+            if (conn->want_read) {
+                pfd.events |= POLLIN;
+            }
+            if (conn->want_write){
+                pfd.events |= POLLOUT;
+            }
+            poll_args.push_back(pfd);
         }
 
-        while (true){
-            int32_t err = one_request(connfd);
-            if (err){
-                break;
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        if (rv < 0 && errno == EINTR){
+            continue;
+        }
+        if (rv < 0){
+            die("poll");
+        }
+
+        if (poll_args[0].revents){
+            if (Conn *conn = handle_accept(fd)){
+                if (fd2conn.size() <= (size_t)conn->fd){
+                    fd2conn.resize(conn->fd +1);
+                }
+                fd2conn[conn->fd] = conn;
             }
         }
 
-        close(connfd);
+        for (size_t i = 1; i<poll_args.size(); ++i){
+            uint32_t ready = poll_args[i].revents;
+            Conn *conn = fd2conn[poll_args[i].fd];
+            if (ready & POLLIN){
+                handle_read(conn);
+            }
+            if (ready & POLLOUT){
+                handle_write(conn);
+            }
+
+            if ((ready & POLLERR) || conn->want_close){
+                (void)close(conn->fd);
+                fd2conn[conn->fd] = NULL;
+                delete conn;
+            }
+
+        }
+
+
     }
 
     return 0;
