@@ -15,12 +15,23 @@
     typedef int socklen_t;
 #else
     #include <unistd.h>
+    #include <fcntl.h>
     #include <arpa/inet.h>
     #include <sys/socket.h>
     #include <netinet/ip.h>
 #endif
 
 const size_t k_max_msg = 4096;
+
+
+struct Conn {
+    int f = -1;
+    bool want_read = false;
+    bool want_write = false;
+    bool want_close = false;
+    std::vector<uint8_t> incoming;
+    std::vector<uint8_t> outgoing;
+};
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -30,6 +41,15 @@ static void die(const char *msg) {
     int err = errno;
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
+}
+
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len){
+    buf.insert(buf.end(), data, data + len);
+}
+
+
+static void buf_consume(std::vector<uint8_t> &buf, size_t n){
+    buf.erase(buf.begin(), buf.begin() + n);
 }
 
 // static void do_something(int connfd) {
@@ -103,11 +123,38 @@ static int32_t one_request(int connfd) {
 }
 
 static void fd_set_nb(int fd){
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL,0) | O_NONBLOCK);
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+#else
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+}
+
+static bool try_one_request(Conn *conn){
+    if (conn->incoming.size() < 4){
+        return false;
+    }
+    uint32_t len = 0;
+    memcpy(&len, conn->incoming.data(), 4);
+    if (len > k_max_msg){
+        conn-> want_close = true;
+        return false;
+    }
+    if (4 + len > conn->incoming.size()){
+        return false;
+    }
+    const uint8_t *request = &conn->incoming[4];
+
+    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
+    buf_append(conn->outgoing, request, len);
+    buf_consume(conn->incoming, 4+ len);
+    return true;
+
 }
 
 static Conn *handle_accept(int fd){
-    struct sockaddr_in client_addr = {}
+    struct sockaddr_in client_addr = {};
     socklen_t addrlen = sizeof(client_addr);
     int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
     if ( connfd < 0 ){
@@ -120,6 +167,36 @@ static Conn *handle_accept(int fd){
     return conn;
 
 }
+
+static void handle_read(Conn *conn){
+    uint8_t buf[64 * 1024];
+    ssize_t rv =read(conn->fd, buf, sizeof(buf));
+    if (rv <= 0){
+        conn->want_close = true;
+        return ;
+    }
+    buf_append(conn->incoming, buf, (size_t)rv);
+    try_one_request(conn);
+    if (conn->outgoing.size() > 0){
+        conn->want_read = false;
+        conn->want_write = true;
+    }
+}
+
+static void handle_write(Conn *conn){
+    assert(conn->outgoing.size() > 0);
+    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if (rv < 0){
+        conn->want_close = true;
+        return;
+    }
+    buf_consume(conn->outgoing, (size_t)rv);
+    if (conn->outgoing.size() == 0){
+        conn->want_read = true;
+        conn->want_write = false;
+    }
+}
+
 
 int main() {
 #ifdef _WIN32
@@ -174,8 +251,6 @@ int main() {
     // }
 
     // Rewriting echo server into event loop
-
-    struct Conn {}
 
 
     std::vector<Conn *> fd2conn;
