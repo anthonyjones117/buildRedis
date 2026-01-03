@@ -1,51 +1,33 @@
-// ======================= client.cpp =======================
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "Ws2_32.lib")
-
-    typedef SOCKET socket_t;
-
-    #define read(fd, buf, n)  recv((fd), (buf), (int)(n), 0)
-    #define write(fd, buf, n) send((fd), (buf), (int)(n), 0)
-    #define close             closesocket
-#else
-    #include <unistd.h>
-    #include <arpa/inet.h>
-    #include <sys/socket.h>
-    #include <netinet/ip.h>
-
-    typedef int socket_t;
-#endif
-
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
 #include <string>
 #include <vector>
 
-static void msg(const char *m) {
-    fprintf(stderr, "%s\n", m);
+
+static void msg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
 }
 
-static void die(const char *m) {
-#ifdef _WIN32
-    int err = WSAGetLastError();
-#else
+static void die(const char *msg) {
     int err = errno;
-#endif
-    fprintf(stderr, "[%d] %s\n", err, m);
+    fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 }
 
-static int32_t read_full(socket_t fd, uint8_t *buf, size_t n) {
+static int32_t read_full(int fd, uint8_t *buf, size_t n) {
     while (n > 0) {
-        ssize_t rv = read(fd, (char *)buf, n);
-        if (rv <= 0) return -1;
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error, or unexpected EOF
+        }
         assert((size_t)rv <= n);
         n -= (size_t)rv;
         buf += rv;
@@ -53,10 +35,12 @@ static int32_t read_full(socket_t fd, uint8_t *buf, size_t n) {
     return 0;
 }
 
-static int32_t write_all(socket_t fd, const uint8_t *buf, size_t n) {
+static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
     while (n > 0) {
-        ssize_t rv = write(fd, (const char *)buf, n);
-        if (rv <= 0) return -1;
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error
+        }
         assert((size_t)rv <= n);
         n -= (size_t)rv;
         buf += rv;
@@ -64,87 +48,94 @@ static int32_t write_all(socket_t fd, const uint8_t *buf, size_t n) {
     return 0;
 }
 
-static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+// append to the back
+static void
+buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
     buf.insert(buf.end(), data, data + len);
 }
 
-const size_t k_max_msg = 32 << 20;
+const size_t k_max_msg = 32 << 20;  // likely larger than the kernel buffer
 
-static int32_t send_req(socket_t fd, const uint8_t *text, uint32_t len) {
-    if (len > k_max_msg) return -1;
+// the `query` function was simply splited into `send_req` and `read_res`.
+static int32_t send_req(int fd, const uint8_t *text, size_t len) {
+    if (len > k_max_msg) {
+        return -1;
+    }
 
     std::vector<uint8_t> wbuf;
     buf_append(wbuf, (const uint8_t *)&len, 4);
     buf_append(wbuf, text, len);
-
     return write_all(fd, wbuf.data(), wbuf.size());
 }
 
-static int32_t read_res(socket_t fd) {
-    std::vector<uint8_t> rbuf(4);
-
-    int32_t err = read_full(fd, rbuf.data(), 4);
+static int32_t read_res(int fd) {
+    // 4 bytes header
+    std::vector<uint8_t> rbuf;
+    rbuf.resize(4);
+    errno = 0;
+    int32_t err = read_full(fd, &rbuf[0], 4);
     if (err) {
-        msg("read failed / EOF");
+        if (errno == 0) {
+            msg("EOF");
+        } else {
+            msg("read() error");
+        }
         return err;
     }
 
     uint32_t len = 0;
-    memcpy(&len, rbuf.data(), 4);
+    memcpy(&len, rbuf.data(), 4);  // assume little endian
     if (len > k_max_msg) {
         msg("too long");
         return -1;
     }
 
+    // reply body
     rbuf.resize(4 + len);
-    err = read_full(fd, rbuf.data() + 4, len);
+    err = read_full(fd, &rbuf[4], len);
     if (err) {
-        msg("read body failed");
+        msg("read() error");
         return err;
     }
 
-    printf("len:%u data:%.*s\n", len, (int)(len < 100 ? len : 100), (char*)rbuf.data() + 4);
+    // do something
+    printf("len:%u data:%.*s\n", len, len < 100 ? len : 100, &rbuf[4]);
     return 0;
 }
 
 int main() {
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        die("WSAStartup()");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket()");
     }
-#endif
-
-    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
-#ifdef _WIN32
-    if (fd == INVALID_SOCKET) die("socket()");
-#else
-    if (fd < 0) die("socket()");
-#endif
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(1234);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
+    addr.sin_port = ntohs(1234);
+    addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK);  // 127.0.0.1
     int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
-    if (rv) die("connect()");
-
-    std::vector<std::string> query_list = {
-        "hello1", "hello2", "hello3",
-        std::string((size_t)k_max_msg, 'z'),
-        "hello5",
-    };
-
-    for (const std::string &s : query_list) {
-        uint32_t len = (uint32_t)s.size();
-        int32_t e = send_req(fd, (const uint8_t *)s.data(), len);
-        if (e) goto L_DONE;
+    if (rv) {
+        die("connect");
     }
 
+    // multiple pipelined requests
+    std::vector<std::string> query_list = {
+        "hello1", "hello2", "hello3",
+        // a large message requires multiple event loop iterations
+        std::string(k_max_msg, 'z'),
+        "hello5",
+    };
+    for (const std::string &s : query_list) {
+        int32_t err = send_req(fd, (uint8_t *)s.data(), s.size());
+        if (err) {
+            goto L_DONE;
+        }
+    }
     for (size_t i = 0; i < query_list.size(); ++i) {
-        int32_t e = read_res(fd);
-        if (e) goto L_DONE;
+        int32_t err = read_res(fd);
+        if (err) {
+            goto L_DONE;
+        }
     }
 
 L_DONE:
