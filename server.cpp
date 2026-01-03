@@ -1,5 +1,4 @@
-// ======================= server.cpp =======================
-// stdlib
+// ======================= server.cpp (no SOCKET truncation) =======================
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -7,7 +6,6 @@
 #include <stdio.h>
 #include <errno.h>
 
-// C++
 #include <vector>
 #include <map>
 
@@ -36,10 +34,6 @@
     typedef unsigned long nfds_t;
 #endif
 
-static void msg(const char *m) {
-    fprintf(stderr, "%s\n", m);
-}
-
 static void die(const char *m) {
 #ifdef _WIN32
     int err = WSAGetLastError();
@@ -50,11 +44,9 @@ static void die(const char *m) {
     abort();
 }
 
-// Windows/non-Windows "would block" detection
 static bool would_block() {
 #ifdef _WIN32
-    int e = WSAGetLastError();
-    return e == WSAEWOULDBLOCK;
+    return WSAGetLastError() == WSAEWOULDBLOCK;
 #else
     return errno == EAGAIN || errno == EWOULDBLOCK;
 #endif
@@ -63,9 +55,7 @@ static bool would_block() {
 static void fd_set_nb(socket_t fd) {
 #ifdef _WIN32
     u_long mode = 1;
-    if (ioctlsocket(fd, FIONBIO, &mode) != 0) {
-        die("ioctlsocket(FIONBIO)");
-    }
+    if (ioctlsocket(fd, FIONBIO, &mode) != 0) die("ioctlsocket(FIONBIO)");
 #else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) die("fcntl(F_GETFL)");
@@ -73,10 +63,17 @@ static void fd_set_nb(socket_t fd) {
 #endif
 }
 
-const size_t k_max_msg = 32 << 20;  // 32MB
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+    buf.insert(buf.end(), data, data + len);
+}
+static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
+    buf.erase(buf.begin(), buf.begin() + n);
+}
+
+const size_t k_max_msg = 32u << 20; // 32MB
 
 struct Conn {
-    socket_t fd = (socket_t)-1;
+    socket_t fd = (socket_t)-1;  // IMPORTANT: socket_t, not int
     bool want_read = false;
     bool want_write = false;
     bool want_close = false;
@@ -84,29 +81,82 @@ struct Conn {
     std::vector<uint8_t> outgoing;
 };
 
-static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
-    buf.insert(buf.end(), data, data + len);
+static bool try_one_request(Conn *conn) {
+    if (conn->incoming.size() < 4) return false;
+
+    uint32_t len = 0;
+    memcpy(&len, conn->incoming.data(), 4);
+
+    if (len > k_max_msg) {
+        fprintf(stderr, "too long\n");
+        conn->want_close = true;
+        return false;
+    }
+    if (4 + (size_t)len > conn->incoming.size()) return false;
+
+    const uint8_t *request = conn->incoming.data() + 4;
+
+    printf("client says: len:%u data:%.*s\n", len, (int)(len < 100 ? len : 100), (const char*)request);
+
+    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
+    buf_append(conn->outgoing, request, len);
+
+    buf_consume(conn->incoming, 4 + len);
+    return true;
 }
 
-static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
-    buf.erase(buf.begin(), buf.begin() + n);
+static void handle_write(Conn *conn) {
+    if (conn->outgoing.empty()) return;
+
+    ssize_t rv = write(conn->fd, (const char*)conn->outgoing.data(), conn->outgoing.size());
+    if (rv < 0) {
+        if (would_block()) return;
+        conn->want_close = true;
+        return;
+    }
+
+    buf_consume(conn->outgoing, (size_t)rv);
+
+    if (conn->outgoing.empty()) {
+        conn->want_write = false;
+        conn->want_read  = true;
+    }
 }
 
-static Conn *handle_accept(socket_t listen_fd) {
-    struct sockaddr_in client_addr = {};
+static void handle_read(Conn *conn) {
+    uint8_t buf[64 * 1024];
+
+    ssize_t rv = read(conn->fd, (char*)buf, sizeof(buf));
+    if (rv < 0) {
+        if (would_block()) return;
+        conn->want_close = true;
+        return;
+    }
+    if (rv == 0) {
+        conn->want_close = true;
+        return;
+    }
+
+    buf_append(conn->incoming, buf, (size_t)rv);
+
+    while (try_one_request(conn)) {}
+
+    if (!conn->outgoing.empty()) {
+        conn->want_read = false;
+        conn->want_write = true;
+        handle_write(conn);
+    }
+}
+
+static Conn* handle_accept(socket_t listen_fd) {
+    sockaddr_in client_addr = {};
     socklen_t addrlen = (socklen_t)sizeof(client_addr);
 
-    socket_t connfd = accept(listen_fd, (struct sockaddr *)&client_addr, &addrlen);
-
+    socket_t connfd = accept(listen_fd, (sockaddr*)&client_addr, &addrlen);
 #ifdef _WIN32
-    if (connfd == INVALID_SOCKET) {
-        // WSAGetLastError() can be checked here if desired
-        return NULL;
-    }
+    if (connfd == INVALID_SOCKET) return NULL;
 #else
-    if (connfd < 0) {
-        return NULL;
-    }
+    if (connfd < 0) return NULL;
 #endif
 
     uint32_t ip = client_addr.sin_addr.s_addr;
@@ -123,84 +173,10 @@ static Conn *handle_accept(socket_t listen_fd) {
     return conn;
 }
 
-static bool try_one_request(Conn *conn) {
-    if (conn->incoming.size() < 4) return false;
-
-    uint32_t len = 0;
-    memcpy(&len, conn->incoming.data(), 4);
-
-    if (len > k_max_msg) {
-        msg("too long");
-        conn->want_close = true;
-        return false;
-    }
-
-    if (4 + len > conn->incoming.size()) return false;
-
-    const uint8_t *request = &conn->incoming[4];
-
-    printf("client says: len:%u data:%.*s\n",
-           len, (int)(len < 100 ? len : 100), (const char*)request);
-
-    // echo response
-    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
-    buf_append(conn->outgoing, request, len);
-
-    buf_consume(conn->incoming, 4 + len);
-    return true;
-}
-
-static void handle_write(Conn *conn) {
-    assert(!conn->outgoing.empty());
-
-    ssize_t rv = write(conn->fd, (const char *)conn->outgoing.data(), conn->outgoing.size());
-    if (rv < 0) {
-        if (would_block()) return;
-        conn->want_close = true;
-        return;
-    }
-
-    buf_consume(conn->outgoing, (size_t)rv);
-
-    if (conn->outgoing.empty()) {
-        conn->want_read = true;
-        conn->want_write = false;
-    }
-}
-
-static void handle_read(Conn *conn) {
-    uint8_t buf[64 * 1024];
-
-    ssize_t rv = read(conn->fd, (char *)buf, sizeof(buf));
-    if (rv < 0) {
-        if (would_block()) return;
-        conn->want_close = true;
-        return;
-    }
-
-    if (rv == 0) {
-        msg("client closed");
-        conn->want_close = true;
-        return;
-    }
-
-    buf_append(conn->incoming, buf, (size_t)rv);
-
-    while (try_one_request(conn)) {}
-
-    if (!conn->outgoing.empty()) {
-        conn->want_read = false;
-        conn->want_write = true;
-        handle_write(conn); // opportunistic flush
-    }
-}
-
 int main() {
 #ifdef _WIN32
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        die("WSAStartup()");
-    }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) die("WSAStartup()");
 #endif
 
     socket_t listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -211,83 +187,75 @@ int main() {
 #endif
 
     int val = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&val, sizeof(val));
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&val, sizeof(val));
 
-    struct sockaddr_in addr = {};
+    sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(1234);
     addr.sin_addr.s_addr = htonl(0);
 
-    int rv = bind(listen_fd, (const struct sockaddr *)&addr, sizeof(addr));
-    if (rv) die("bind()");
+    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) != 0) die("bind()");
+    if (listen(listen_fd, SOMAXCONN) != 0) die("listen()");
 
     fd_set_nb(listen_fd);
 
-    rv = listen(listen_fd, SOMAXCONN);
-    if (rv) die("listen()");
-
-    std::map<socket_t, Conn *> fd2conn;
+    std::map<socket_t, Conn*> fd2conn;   // IMPORTANT: key is socket_t
     std::vector<pollfd_t> poll_args;
 
     while (true) {
         poll_args.clear();
 
-        // listening socket
         pollfd_t p0 = {};
         p0.fd = listen_fd;
         p0.events = POLLIN;
         poll_args.push_back(p0);
 
-        // client sockets
         for (auto &pair : fd2conn) {
             Conn *conn = pair.second;
-            if (!conn) continue;
-
             pollfd_t p = {};
             p.fd = conn->fd;
-            p.events = POLLERR;
+            p.events = 0;
             if (conn->want_read)  p.events |= POLLIN;
             if (conn->want_write) p.events |= POLLOUT;
             poll_args.push_back(p);
         }
 
 #ifdef _WIN32
+        for (size_t i = 0; i < poll_args.size(); ++i) {
+            fprintf(stderr, "poll_args[%zu].fd=%llu events=0x%hx\n",
+                    i, (unsigned long long)poll_args[i].fd, poll_args[i].events);
+            if (poll_args[i].fd == INVALID_SOCKET) {
+                fprintf(stderr, "BUG: INVALID_SOCKET in poll_args[%zu]\n", i);
+                abort();
+            }
+        }
+#endif
+
+#ifdef _WIN32
         int pr = WSAPoll(poll_args.data(), (nfds_t)poll_args.size(), -1);
 #else
         int pr = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
 #endif
-        if (pr < 0) {
-#ifndef _WIN32
-            if (errno == EINTR) continue;
-#endif
-            die("poll");
-        }
+        if (pr < 0) die("poll");
 
-        // accept new client
         if (poll_args[0].revents & POLLIN) {
             if (Conn *conn = handle_accept(listen_fd)) {
                 fd2conn[conn->fd] = conn;
             }
         }
 
-        // handle clients
         for (size_t i = 1; i < poll_args.size(); ++i) {
             uint32_t ready = poll_args[i].revents;
             if (!ready) continue;
 
-            socket_t sock_fd = poll_args[i].fd;
-
+            socket_t sock_fd = poll_args[i].fd; // IMPORTANT: socket_t, no int cast
             auto it = fd2conn.find(sock_fd);
             if (it == fd2conn.end()) continue;
 
             Conn *conn = it->second;
 
-            if (ready & POLLIN) {
-                if (conn->want_read) handle_read(conn);
-            }
-            if (ready & POLLOUT) {
-                if (conn->want_write) handle_write(conn);
-            }
+            if (ready & POLLIN)  handle_read(conn);
+            if (ready & POLLOUT) handle_write(conn);
 
             if ((ready & POLLERR) || conn->want_close) {
                 close(conn->fd);
@@ -296,6 +264,4 @@ int main() {
             }
         }
     }
-
-    return 0;
 }
